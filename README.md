@@ -1,6 +1,6 @@
 # nextbus viewer
 
-The code behind jefftk.com/nextbus/
+The code behind `jefftk.com/nextbus/`.
 
 Installation:
 
