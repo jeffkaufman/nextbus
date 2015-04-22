@@ -53,10 +53,15 @@ def to_time(seconds):
   return "%ssec" % seconds
 
 def nextbus_stop_helper(agency, route, stop, path_adjust="", ages={}):
+  if stop.isdigit():
+      load_as="stopId=%s" % stop
+  else:
+      load_as="s=%s&r=%s" % (stop, route)
+
   try:
       xmldoc = minidom.parseString(slurp(
           "http://webservices.nextbus.com/service/publicXMLFeed?"
-          "command=predictions&a=%s&stopId=%s&useShortNames=true" % (agency, stop),
+          "command=predictions&a=%s&%s&useShortNames=true" % (agency, load_as),
           timeout=1))
   except Exception:
       return ("Nextbus Error",
