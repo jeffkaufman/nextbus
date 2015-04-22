@@ -140,7 +140,8 @@ def nextbus_route_helper(agency, route):
       stops[stop.getAttribute("tag")] = [
           escape(stop.getAttribute("title")),
           float(stop.getAttribute("lat")),
-          float(stop.getAttribute("lon"))]
+          float(stop.getAttribute("lon")),
+          escape(stop.getAttribute("stopId"))]
 
   r = [] # [[[direction_tag, direction_name], [[stop_tag, stop_name, lat, lon], ...]], ...]
   for direction in xmldoc.getElementsByTagName("direction"):
@@ -149,8 +150,8 @@ def nextbus_route_helper(agency, route):
     direction_title = escape(direction.getAttribute("title"))
     for stop in direction.getElementsByTagName("stop"):
       tag = escape(stop.getAttribute("tag"))
-      stop_name, lat, lon = stops[tag]
-      direction_stops.append([tag, stop_name, lat, lon])
+      stop_name, lat, lon, stopid = stops[tag]
+      direction_stops.append([tag, stop_name, lat, lon, stopid])
     r.append([[direction_tag, direction_title], direction_stops])
 
   route_title = route
@@ -237,7 +238,7 @@ def nextbus_stop_vehicle(agency, route, stop, vehicleid):
 
   for [direction_tag, direction_title], stops in stop_info:
     polyline = []
-    for stop_tag, _, lat, lon in stops:
+    for stop_tag, _, lat, lon, stop_id in stops:
       seen(lat, lon)
       if stop_tag == stop:
         desired_stop_loc = [lat, lon]
@@ -515,9 +516,10 @@ def nextbus_route(agency, route):
 
   for (direction_tag, direction_title), stops in stop_info:
     escaped_content.append("<h2>%s</h2>" % direction_title)
-    for stop_tag, stop_name, _, _ in stops:
+    for stop_tag, stop_name, _, _, stop_id in stops:
+      use_id = stop_id or stop_tag
       escaped_content.append(
-          '<a class=row href="%s/">%s</a>' % (stop_tag, stop_name))
+          '<a class=row href="%s/">%s</a>' % (use_id, stop_name))
 
   return render_page(
       title="%s Stops" % route_title,
