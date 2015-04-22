@@ -240,7 +240,7 @@ def nextbus_stop_vehicle(agency, route, stop, vehicleid):
     polyline = []
     for stop_tag, _, lat, lon, stop_id in stops:
       seen(lat, lon)
-      if stop_tag == stop:
+      if stop_tag == stop or stop_id == stop:
         desired_stop_loc = [lat, lon]
       polyline.append((lat, lon))
     polylines.append(polyline)
