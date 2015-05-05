@@ -143,7 +143,7 @@ def nextbus_route_helper(agency, route):
           float(stop.getAttribute("lon")),
           escape(stop.getAttribute("stopId"))]
 
-  r = [] # [[[direction_tag, direction_name], [[stop_tag, stop_name, lat, lon], ...]], ...]
+  r = [] # [[[direction_tag, direction_name], [[stop_tag, stop_name, lat, lon, stopid], ...]], ...]
   for direction in xmldoc.getElementsByTagName("direction"):
     direction_stops = []
     direction_tag= escape(direction.getAttribute("tag"))
@@ -479,31 +479,35 @@ def nextbus_stop_relative(agency, route, stop, relative):
 
   for [direction_tag, direction_title], stops in stop_info:
     previous_stop_tag = None
+    previous_stop_id = None
     previous_stop_name = None
-    for stop_tag, stop_name, _, _ in stops:
-      if relative == "next" and previous_stop_tag == stop:
-        options[stop_tag, stop_name].append(direction_title)
-      elif relative == "previous" and stop_tag == stop:
-        options[previous_stop_tag, previous_stop_name].append(direction_title)
+    for stop_tag, stop_name, _, _, stop_id in stops:
+      if relative == "next" and (previous_stop_tag == stop or
+                                 previous_stop_id == stop):
+        options[stop_tag or stop_id, stop_name].append(direction_title)
+      elif relative == "previous" and (stop_tag == stop or
+                                       stop_id == stop):
+        options[previous_stop_tag or previous_stop_id, previous_stop_name].append(direction_title)
 
       previous_stop_tag = stop_tag
+      previous_stop_id = stop_id
       previous_stop_name = stop_name
 
   if not options:
     return html_redirect("../")
 
   if len(options) == 1:
-    stop_tag, stop_name = options.keys()[0]
+    stop_identifier, stop_name = options.keys()[0]
 
-    if stop_tag is None:
+    if stop_identifier is None:
       return html_redirect("../")
     else:
-      return html_redirect("../../%s" % stop_tag)
+      return html_redirect("../../%s" % stop_identifier)
 
   escaped_content = []
-  for (stop_tag, stop_name), directions in options.items():
+  for (stop_identifier, stop_name), directions in options.items():
     for direction in directions:
-      escaped_content.append("<span class=row><a href='../../%s'>%s</a> (%s)</span>" % (stop_tag, stop_name, direction))
+      escaped_content.append("<span class=row><a href='../../%s'>%s</a> (%s)</span>" % (stop_identifier, stop_name, direction))
 
   return render_page(
       title="Multiple options for the %s stop" % relative,
