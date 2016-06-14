@@ -30,3 +30,8 @@ Installation:
         rewrite ^/nextbus/(.*[^/])$ /nextbus/$1/ permanent;
 
 4. Done!
+
+
+Copying:
+
+* Distributed under the GPL.  For details see the LICENSE file.
