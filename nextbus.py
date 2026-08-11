@@ -104,7 +104,6 @@ def nextbus_stop_helper(route, stop, path_adjust=""):
     doc = mbta_get("/predictions", {
         "filter[stop]": stop,
         "include": "vehicle,route,stop",
-        "sort": "arrival_time",
     })
   except Exception:
     return (ERROR_TITLE,
@@ -123,8 +122,10 @@ def nextbus_stop_helper(route, stop, path_adjust=""):
 
   now = datetime.datetime.now(datetime.timezone.utc)
 
-  # (route_id, direction_id) -> [prediction_html, ...], in chronological
-  # order (the API call above is already sorted by arrival_time).
+  # (route_id, direction_id) -> [(seconds, prediction_html), ...]
+  # The API doesn't reliably sort predictions that only have a
+  # departure_time (e.g. the start of a trip), so we sort ourselves
+  # below.
   buckets = defaultdict(list)
 
   for prediction in doc["data"]:
@@ -175,7 +176,7 @@ def nextbus_stop_helper(route, stop, path_adjust=""):
     else:
       prediction_html = "<div class=prediction>%s</div>" % time_display
 
-    buckets[route_id, direction_id].append(prediction_html)
+    buckets[route_id, direction_id].append((seconds, prediction_html))
 
   route_titles = {}  # route_id -> title
   direction_names = {}  # route_id -> [name0, name1]
@@ -205,7 +206,8 @@ def nextbus_stop_helper(route, stop, path_adjust=""):
     else:
       header = "<h2>%s</h2>" % escape(title)
     if predictions:
-      body = "\n".join(predictions)
+      predictions.sort(key=lambda p: p[0])
+      body = "\n".join(html for _, html in predictions)
     else:
       body = "<div class=prediction>No predictions.</div>"
     sections.append((title, route_id, header + "\n" + body))
