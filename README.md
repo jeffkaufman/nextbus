@@ -2,11 +2,8 @@
 
 The code behind `jefftk.com/nextbus/`.
 
-Originally a thin wrapper around the MBTA's old NextBus-based predictions
-feed. The MBTA retired that feed in favor of their own
-[V3 API](https://api-v3.mbta.com/), so this now talks to that instead.
-Since the V3 API only covers the MBTA, this is MBTA-only now (it used to
-support any transit agency running NextBus).
+A thin wrapper around the MBTA's [V3 API](https://api-v3.mbta.com/),
+covering routes, stops, predictions, and vehicle locations for the MBTA.
 
 Installation:
 

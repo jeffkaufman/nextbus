@@ -1,8 +1,6 @@
 # The code behind jefftk.com/nextbus/
 #
 # A thin wrapper around the MBTA's V3 API (https://api-v3.mbta.com/).
-# Originally this wrapped MBTA's old NextBus-based feed, but the MBTA
-# retired that in favor of their own API.
 
 import datetime
 import json
@@ -187,10 +185,10 @@ def nextbus_stop_helper(route, stop, path_adjust=""):
       direction_names[rid] = resource["attributes"].get("direction_names") or []
 
   if route not in route_titles:
-    # The requested route has no predictions for this stop at all --
-    # still show it (empty), same as the old NextBus feed did.  We
-    # don't have its title from the predictions response since it's
-    # not referenced anywhere in it, so fetch it directly.
+    # The requested route has no predictions for this stop at all, but
+    # we still want to show it (empty). We don't have its title from
+    # the predictions response since it's not referenced anywhere in
+    # it, so fetch it directly.
     try:
       route_doc = mbta_get("/routes/%s" % route, {}, cache=True)
       route_titles[route] = route_display_title(route_doc["data"]["attributes"], route)
