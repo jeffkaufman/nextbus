@@ -22,16 +22,27 @@ Installation:
         }
 
 3. Set up your wsgi server.  I like uwsgi.  Install it (with its python3
-   plugin), then create an init script.  On Ubuntu 14.04 I set up
-   /etc/init/uwsgi-nextbus.conf with:
+   plugin), then create a systemd unit.  On Ubuntu 22.04 I set up
+   /etc/systemd/system/uwsgi-nextbus.service with:
 
-        description "nextbus uWSGI server"
+        [Unit]
+        Description=uWSGI nextbus
 
-        start on runlevel [2345]
-        stop on runlevel [!2345]
-        respawn
-        env MBTA_API_KEY=your-key-here
-        exec /usr/local/bin/uwsgi --plugin python3 --socket :7091 --wsgi-file /home/jefftk/nextbus/nextbus.py
+        [Service]
+        Environment=MBTA_API_KEY=your-key-here
+        ExecStart=/usr/bin/uwsgi_python3 --socket :7091 --wsgi-file /home/jefftk/nextbus/nextbus.py
+        Restart=always
+        KillSignal=SIGQUIT
+        Type=notify
+        NotifyAccess=all
+
+        [Install]
+        WantedBy=multi-user.target
+
+   Then `systemctl daemon-reload && systemctl enable --now uwsgi-nextbus`.
+   (`uwsgi_python3` is a distro-provided binary that auto-loads the
+   python3 plugin; if yours doesn't have it, use `uwsgi --plugin python3`
+   instead.)
 
 4. Tell your web server to make some redirects the app needs:
 
