@@ -1,30 +1,40 @@
-# The code behind 
+# The code behind jefftk.com/nextbus/
 #
-#
-#
-#
+# A thin wrapper around the MBTA's V3 API (https://api-v3.mbta.com/).
+# Originally this wrapped MBTA's old NextBus-based feed, but the MBTA
+# retired that in favor of their own API.
 
-
-
-import re
-from xml.dom import minidom
-from collections import defaultdict
-import urllib2
+import datetime
 import json
+import os
+import re
+import time
+import traceback
+import urllib.parse
+import urllib.request
+from collections import defaultdict
+
+MBTA_API_BASE = "https://api-v3.mbta.com"
+MBTA_API_KEY = os.environ.get("MBTA_API_KEY")
+
+ERROR_TITLE = "MBTA Error"
+
+# Very small TTL cache for the slow-changing lookups (routes, stop
+# lists).  The MBTA API allows only 20 requests/minute without an API
+# key, and a single page view (e.g. clicking "next") can otherwise cost
+# several requests, so this keeps repeat browsing of the same route
+# cheap.  Live data (predictions, vehicles) is never cached.
+_cache = {}  # (endpoint, params tuple) -> (expires_at, value)
+CACHE_TTL_SECONDS = 30
+
 
 def escape(s):
-    s = unicode(s)
-    for f,r in [["&", "&amp;"],
-                ["<", "&lt;"],
-                [">", "&gt;"]]:
-        s = s.replace(f,r)
-    return s
-
-def slurp(url, data=None, headers={}, timeout=60):
-    identifier = "Jeff Kaufman"
-    botname = "bus predictions"
-    headers['User-Agent'] = '%s bot by %s (www.jefftk.com)' % (botname, identifier)
-    return urllib2.urlopen(urllib2.Request(url, data, headers), None, timeout).read()
+  s = str(s)
+  for f, r in [["&", "&amp;"],
+               ["<", "&lt;"],
+               [">", "&gt;"]]:
+    s = s.replace(f, r)
+  return s
 
 
 def natural_sort_in_place(l):
@@ -35,11 +45,54 @@ def natural_sort_in_place(l):
   # isn't technically correct, since we're no longer lexically
   # sorting, but it should work fine on the data we have.
   convert = lambda text: int(text) if text.isdigit() else text
-  alphanum_key = lambda key: [ convert(c) for c in re.split('([0-9]+)', str(key)) ]
+  alphanum_key = lambda key: [convert(c) for c in re.split('([0-9]+)', str(key))]
   l.sort(key=alphanum_key)
 
+
+def to_time(seconds):
+  if seconds > 60:
+    return "%smin %ssec" % (seconds // 60, seconds % 60)
+  return "%ssec" % seconds
+
+
+def mbta_get(endpoint, params, timeout=5, cache=False):
+  cache_key = (endpoint, tuple(sorted(params.items())))
+  if cache:
+    cached = _cache.get(cache_key)
+    if cached and cached[0] > time.time():
+      return cached[1]
+
+  query = urllib.parse.urlencode(params)
+  url = "%s%s?%s" % (MBTA_API_BASE, endpoint, query)
+  headers = {
+      "User-Agent": "nextbus viewer bot by Jeff Kaufman (www.jefftk.com)",
+      "Accept": "application/vnd.api+json",
+  }
+  if MBTA_API_KEY:
+    headers["x-api-key"] = MBTA_API_KEY
+
+  request = urllib.request.Request(url, headers=headers)
+  with urllib.request.urlopen(request, timeout=timeout) as response:
+    value = json.loads(response.read().decode("utf8"))
+
+  if cache:
+    _cache[cache_key] = (time.time() + CACHE_TTL_SECONDS, value)
+  return value
+
+
+def jsonapi_include_index(document):
+  index = {}
+  for resource in document.get("included", []):
+    index[(resource["type"], resource["id"])] = resource
+  return index
+
+
+def route_display_title(route_attrs, route_id):
+  return route_attrs.get("short_name") or route_attrs.get("long_name") or route_id
+
+
 def nextbus_stop(agency, route, stop):
-  title, content = nextbus_stop_helper(agency, route, stop)
+  title, content = nextbus_stop_helper(route, stop)
   return render_page(
       title=title,
       escaped_content=content,
@@ -47,184 +100,212 @@ def nextbus_stop(agency, route, stop):
       include_refresh=True,
       include_arrows=True)
 
-def to_time(seconds):
-  if seconds > 60:
-    return "%smin %ssec" % (seconds / 60, seconds % 60)
-  return "%ssec" % seconds
 
-def nextbus_stop_helper(agency, route, stop, path_adjust="", ages={}):
-  if stop.isdigit():
-      load_as="stopId=%s" % stop
-  else:
-      load_as="s=%s&r=%s" % (stop, route)
-
+def nextbus_stop_helper(route, stop, path_adjust=""):
   try:
-      xmldoc = minidom.parseString(slurp(
-          "http://webservices.nextbus.com/service/publicXMLFeed?"
-          "command=predictions&a=%s&%s&useShortNames=true" % (agency, load_as),
-          timeout=1))
+    doc = mbta_get("/predictions", {
+        "filter[stop]": stop,
+        "include": "vehicle,route,stop",
+        "sort": "arrival_time",
+    })
   except Exception:
-      return ("Nextbus Error",
-              ["Couldn't reach predictions server.  Try refreshing?"])
+    return (ERROR_TITLE,
+            ["Couldn't reach predictions server.  Try refreshing?"])
 
-  prediction_sections = [] # [route_tag, escaped_html]
-  stop_title = None
+  idx = jsonapi_include_index(doc)
 
-  no_predictions = "<div class=prediction>No predictions.</div>"
+  # Predictions for a parent station (e.g. a subway station) are
+  # actually tied to its child platform stops, so their ids won't
+  # match `stop`; any of them has the name we want, though.
+  stop_title = stop
+  for (rtype, rid), resource in idx.items():
+    if rtype == "stop":
+      stop_title = resource["attributes"]["name"]
+      break
 
-  for predictions in xmldoc.getElementsByTagName("predictions"):
-    # prefer the name for this stop used by the route in question
-    if stop_title is None or predictions.getAttribute("routeTag") == route:
-      stop_title = predictions.getAttribute("stopTitle")
+  now = datetime.datetime.now(datetime.timezone.utc)
 
-    prediction_section = []
+  # (route_id, direction_id) -> [prediction_html, ...], in chronological
+  # order (the API call above is already sorted by arrival_time).
+  buckets = defaultdict(list)
 
-    if predictions.getAttribute("dirTitleBecauseNoPredictions"):
-      prediction_section.append("<h2 class>%s: %s</h2>" % (
-          predictions.getAttribute("routeTitle"),
-          predictions.getAttribute("dirTitleBecauseNoPredictions")))
-      prediction_section.append(no_predictions)
+  for prediction in doc["data"]:
+    attrs = prediction["attributes"]
+    rel = prediction["relationships"]
 
-    for direction in predictions.getElementsByTagName("direction"):
-      prediction_section.append("<h2 class>%s: %s</h2>" % (
-          predictions.getAttribute("routeTitle"),
-          direction.getAttribute("title")))
-      for prediction in direction.getElementsByTagName("prediction"):
-        vid = prediction.getAttribute("vehicle")
-        prediction_section.append("<div class=prediction>%s minute%s (%s%svehicle %s%s)</div>" % (
-            escape(prediction.getAttribute("minutes")),
-            "" if prediction.getAttribute("minutes") == "1" else "s",
-            "layover, " if prediction.getAttribute("affectedByLayover") == "true" else "",
-            "delayed, " if prediction.getAttribute("delayed") == "true" else "",
-            "<a href='%s../../%s/%s/vehicle/%s'>%s</a>" % (
-                path_adjust,
-                predictions.getAttribute("routeTag"),
-                stop,
-                vid,
-                vid),
-            (", %s" % to_time(ages[vid])) if vid in ages else ""))
+    route_data = rel.get("route", {}).get("data")
+    if not route_data:
+      continue
+    route_id = route_data["id"]
+    direction_id = attrs.get("direction_id")
 
-    prediction_sections.append((predictions.getAttribute("routeTitle"),
-                                predictions.getAttribute("routeTag"),
-                                "\n".join(prediction_section)))
+    time_str = attrs.get("arrival_time") or attrs.get("departure_time")
+    if time_str is None:
+      continue
+    when = datetime.datetime.fromisoformat(time_str)
+    seconds = max(0, int((when - now).total_seconds()))
 
-  natural_sort_in_place(prediction_sections)
+    if seconds < 30:
+      time_display = "Due"
+    else:
+      minutes = round(seconds / 60.0)
+      time_display = "%d minute%s" % (minutes, "" if minutes == 1 else "s")
+
+    extras = []
+    if attrs.get("status"):
+      extras.append(escape(attrs["status"]))
+
+    vehicle_data = rel.get("vehicle", {}).get("data")
+    if vehicle_data:
+      vehicle = idx.get(("vehicle", vehicle_data["id"]))
+      if vehicle:
+        vid = vehicle["id"]
+        label = vehicle["attributes"].get("label") or vid
+        age_str = ""
+        updated_at = vehicle["attributes"].get("updated_at")
+        if updated_at:
+          updated = datetime.datetime.fromisoformat(updated_at)
+          age = int((now - updated).total_seconds())
+          if age >= 0:
+            age_str = ", %s" % to_time(age)
+        extras.append("vehicle <a href='%s../../%s/%s/vehicle/%s'>%s</a>%s" % (
+            path_adjust, route_id, stop, vid, escape(label), age_str))
+
+    if extras:
+      prediction_html = "<div class=prediction>%s (%s)</div>" % (
+          time_display, ", ".join(extras))
+    else:
+      prediction_html = "<div class=prediction>%s</div>" % time_display
+
+    buckets[route_id, direction_id].append(prediction_html)
+
+  route_titles = {}  # route_id -> title
+  direction_names = {}  # route_id -> [name0, name1]
+  for (rtype, rid), resource in idx.items():
+    if rtype == "route":
+      route_titles[rid] = route_display_title(resource["attributes"], rid)
+      direction_names[rid] = resource["attributes"].get("direction_names") or []
+
+  if route not in route_titles:
+    # The requested route has no predictions for this stop at all --
+    # still show it (empty), same as the old NextBus feed did.  We
+    # don't have its title from the predictions response since it's
+    # not referenced anywhere in it, so fetch it directly.
+    try:
+      route_doc = mbta_get("/routes/%s" % route, {}, cache=True)
+      route_titles[route] = route_display_title(route_doc["data"]["attributes"], route)
+    except Exception:
+      route_titles[route] = route
+    buckets[route, None] = []
+
+  sections = []  # (sort_title, route_id, html)
+  for (route_id, direction_id), predictions in buckets.items():
+    title = route_titles.get(route_id, route_id)
+    names = direction_names.get(route_id, [])
+    if direction_id is not None and direction_id < len(names) and names[direction_id]:
+      header = "<h2>%s: %s</h2>" % (escape(title), escape(names[direction_id]))
+    else:
+      header = "<h2>%s</h2>" % escape(title)
+    if predictions:
+      body = "\n".join(predictions)
+    else:
+      body = "<div class=prediction>No predictions.</div>"
+    sections.append((title, route_id, header + "\n" + body))
+
+  natural_sort_in_place(sections)
 
   escaped_content = []
   # sort the route requested before others
-  for _, route_tag, prediction_section in prediction_sections:
-    if route_tag == route:
-      escaped_content.append(prediction_section)
-  # now include any that have predictions
-  for _, route_tag, prediction_section in prediction_sections:
-    if route_tag != route:
-      if no_predictions not in prediction_section:
-        escaped_content.append(prediction_section)
-  # now the ones without predictions
-  for _, route_tag, prediction_section in prediction_sections:
-    if route_tag != route:
-      if no_predictions in prediction_section:
-        escaped_content.append(prediction_section)
+  for _, route_id, section_html in sections:
+    if route_id == route:
+      escaped_content.append(section_html)
+  for _, route_id, section_html in sections:
+    if route_id != route:
+      escaped_content.append(section_html)
 
   return escape(stop_title), escaped_content
 
-def nextbus_route_helper(agency, route):
-  stops = {}
-  xmldoc = minidom.parseString(slurp(
-      "http://webservices.nextbus.com/service/publicXMLFeed?"
-      "command=routeConfig&terse&a=%s&r=%s" % (agency, route),
-      timeout=2))
 
-  for stop in xmldoc.getElementsByTagName("stop"):
-    if stop.getAttribute("title"):
-      stops[stop.getAttribute("tag")] = [
-          escape(stop.getAttribute("title")),
-          float(stop.getAttribute("lat")),
-          float(stop.getAttribute("lon")),
-          escape(stop.getAttribute("stopId"))]
+def nextbus_route_helper(route):
+  route_doc = mbta_get("/routes/%s" % route, {}, cache=True)
+  route_attrs = route_doc["data"]["attributes"]
+  route_title = route_display_title(route_attrs, route)
+  direction_names = route_attrs.get("direction_names") or []
+  direction_destinations = route_attrs.get("direction_destinations") or []
 
-  r = [] # [[[direction_tag, direction_name], [[stop_tag, stop_name, lat, lon, stopid], ...]], ...]
-  for direction in xmldoc.getElementsByTagName("direction"):
+  r = []  # [[[direction_id, direction_title], [[stop_id, stop_name, lat, lon, stop_id], ...]], ...]
+  for direction_id in range(len(direction_names)):
+    stops_doc = mbta_get("/stops", {
+        "filter[route]": route,
+        "filter[direction_id]": direction_id,
+    }, cache=True)
+
     direction_stops = []
-    direction_tag= escape(direction.getAttribute("tag"))
-    direction_title = escape(direction.getAttribute("title"))
-    for stop in direction.getElementsByTagName("stop"):
-      tag = escape(stop.getAttribute("tag"))
-      stop_name, lat, lon, stopid = stops[tag]
-      direction_stops.append([tag, stop_name, lat, lon, stopid])
-    r.append([[direction_tag, direction_title], direction_stops])
+    for stop in stops_doc["data"]:
+      attrs = stop["attributes"]
+      if not attrs.get("name"):
+        continue
+      direction_stops.append([
+          stop["id"], escape(attrs["name"]),
+          attrs.get("latitude"), attrs.get("longitude"), stop["id"]])
 
-  route_title = route
-  for route_element in xmldoc.getElementsByTagName("route"):
-    route_title = escape(route_element.getAttribute("title"))
+    if not direction_stops:
+      continue
 
-  if agency == "mbta":
-    # We want to sort with as:
-    #   101_0_var1
-    #   101_1_var1
-    #   101_0_var3
-    #   101_1_var3
-    # This is because with the mbta low numbered variants are usually
-    # what people want.
+    name = direction_names[direction_id] or ""
+    destination = (direction_destinations[direction_id]
+                   if direction_id < len(direction_destinations) else None)
+    direction_title = "%s to %s" % (name, destination) if destination else name
 
-    def sortkey(entry):
-      direction_tag = entry[0][0]
-      match = re.findall("^(\d+)_(\d+)_var(\d+)$", direction_tag)
-      if not match:
-        return entry
-      route, direction_bit, variant = match[0]
-      return int(route), int(variant), int(direction_bit)
-
-    r.sort(key=sortkey)
-  else:
-    r.sort()
+    r.append([[str(direction_id), escape(direction_title)], direction_stops])
 
   return route_title, r
+
 
 def html_redirect(dest):
   return "<meta http-equiv='refresh' content='0;URL=%s'>" % dest
 
-def bus_location_helper(agency, route, vehicleid):
-  xmldoc = minidom.parseString(slurp(
-      "http://webservices.nextbus.com/service/publicXMLFeed?"
-      "command=vehicleLocations&a=%s&t=0" % agency,
-      timeout=1))
-  # just interesting vehicles:
-  vehicles = {} # vid -> [route, dirtag, lat, lon, age, heading, predictable]
 
-  # all vehicles:
-  ages = {} # vid -> age
-  for vehicle_node in xmldoc.getElementsByTagName("vehicle"):
-    vid = escape(vehicle_node.getAttribute("id"))
-    rtag = vehicle_node.getAttribute("routeTag")
-    age = int(vehicle_node.getAttribute("secsSinceReport"))
-    ages[vid] = age
-    if route == rtag or vid == vehicleid:
-        vehicles[escape(vid)] = [
-            escape(rtag),
-            escape(vehicle_node.getAttribute("dirTag")),
-            float(vehicle_node.getAttribute("lat")),
-            float(vehicle_node.getAttribute("lon")),
-            age,
-            int(vehicle_node.getAttribute("heading")),
-            bool(vehicle_node.getAttribute("predictable"))]
-  return vehicles, ages
+def vehicles_for_route(route):
+  doc = mbta_get("/vehicles", {"filter[route]": route})
+  vehicles = {}  # id -> [route_id, direction_id, lat, lon, age, heading]
+  now = datetime.datetime.now(datetime.timezone.utc)
+  for vehicle in doc["data"]:
+    attrs = vehicle["attributes"]
+    updated_at = attrs.get("updated_at")
+    age = 0
+    if updated_at:
+      age = max(0, int((now - datetime.datetime.fromisoformat(updated_at)).total_seconds()))
+    bearing = attrs.get("bearing")
+    route_data = vehicle["relationships"].get("route", {}).get("data")
+    vehicles[vehicle["id"]] = [
+        route_data["id"] if route_data else None,
+        attrs.get("direction_id"),
+        attrs.get("latitude"),
+        attrs.get("longitude"),
+        age,
+        bearing if bearing is not None else -1,
+    ]
+  return vehicles
+
 
 def nextbus_stop_vehicle(agency, route, stop, vehicleid):
   # We need to draw:
   # * the route
   # * the bus in question, if found (display message if not found)
-  # * maybe the other buses on the route
+  # * the other buses currently serving the route
   # * the stop in question
 
-  route_title, stop_info = nextbus_route_helper(agency, route)
+  route_title, stop_info = nextbus_route_helper(route)
 
   polylines = []
   desired_stop_loc = None
 
-  viewport = [None, None, None, None] # minlat, minlon, maxlat, maxlon
+  viewport = [None, None, None, None]  # minlat, minlon, maxlat, maxlon
   def seen(lat, lon):
     minlat, minlon, maxlat, maxlon = viewport
+    if lat is None or lon is None:
+      return
     if not minlat or lat < minlat:
       viewport[0] = lat
     if not minlon or lon < minlon:
@@ -236,11 +317,11 @@ def nextbus_stop_vehicle(agency, route, stop, vehicleid):
 
   messages = []
 
-  for [direction_tag, direction_title], stops in stop_info:
+  for [direction_id, direction_title], stops in stop_info:
     polyline = []
-    for stop_tag, _, lat, lon, stop_id in stops:
+    for stop_id, _, lat, lon, _ in stops:
       seen(lat, lon)
-      if stop_tag == stop or stop_id == stop:
+      if stop_id == stop:
         desired_stop_loc = [lat, lon]
       polyline.append((lat, lon))
     polylines.append(polyline)
@@ -249,23 +330,28 @@ def nextbus_stop_vehicle(agency, route, stop, vehicleid):
     messages.append("Stop %s doesn't appear to be on the %s route." % (
         escape(stop), escape(route)))
 
-  vehicles, ages = bus_location_helper(agency, route, vehicleid)
-  desired_vehicle_loc = None
+  other_vehicles = vehicles_for_route(route)
   other_vehicle_locs = []
-  desired_vehicle_current_route = None
-
-  for vid, (routeTag, dirTag, lat, lon, age, heading, predictable) in vehicles.items():
-    seen(lat, lon)
+  for vid, (v_route, v_direction, lat, lon, age, heading) in other_vehicles.items():
     if vid == vehicleid:
-      desired_vehicle_loc = [lat, lon, vid, heading]
-      if routeTag != route:
-          desired_vehicle_current_route = routeTag
-    else:
-      other_vehicle_locs.append([lat, lon, vid, heading])
+      continue
+    seen(lat, lon)
+    other_vehicle_locs.append([lat, lon, vid, heading])
 
-  if not desired_vehicle_loc:
-    messages.append("Vehicle %s isn't reporting a location." % (
-      escape(vehicleid)))
+  desired_vehicle_loc = None
+  desired_vehicle_current_route = None
+  try:
+    vehicle_doc = mbta_get("/vehicles/%s" % vehicleid, {})
+    vattrs = vehicle_doc["data"]["attributes"]
+    lat, lon = vattrs.get("latitude"), vattrs.get("longitude")
+    seen(lat, lon)
+    bearing = vattrs.get("bearing")
+    desired_vehicle_loc = [lat, lon, vehicleid, bearing if bearing is not None else -1]
+    route_data = vehicle_doc["data"]["relationships"].get("route", {}).get("data")
+    if route_data and route_data["id"] != route:
+      desired_vehicle_current_route = route_data["id"]
+  except Exception:
+    messages.append("Vehicle %s isn't reporting a location." % escape(vehicleid))
 
   escaped_content = []
   for message in messages:
@@ -324,7 +410,7 @@ function draw_bus(bus, color, extra) {
 
   var screen_coord = to_screen([lat, lon]);
 
-  if (heading > 0) {
+  if (heading >= 0) {
     draw_screen_triangle(screen_coord[0], screen_coord[1], heading, color);
   } else {
     draw_screen_circle(screen_coord[0], screen_coord[1], color, 0.03);
@@ -449,17 +535,16 @@ svg.style.marginBottom = margin_adjustment + "px";
 """)
 
   stop_title, stop_content = nextbus_stop_helper(
-      agency, route, stop, path_adjust="../../", ages=ages)
-  if stop_title != "Nextbus Error":
-      escaped_content.extend(stop_content)
+      route, stop, path_adjust="../../")
+  if stop_title != ERROR_TITLE:
+    escaped_content.extend(stop_content)
   else:
-      escaped_content.append("<div>%s</div>" % "".join(stop_content))
+    escaped_content.append("<div>%s</div>" % "".join(stop_content))
 
   escaped_content.append("""
 <div>
 <br><small><i>Key: Chosen bus is red, other buses are blue, stop
-is green.  Circular buses are ones that Nextbus knows the location of,
-but is having trouble predicting movements for.</i></small>
+is green.  Circular buses are ones whose heading isn't currently known.</i></small>
 </div>
   """)
 
@@ -469,27 +554,24 @@ but is having trouble predicting movements for.</i></small>
       include_refresh=True,
       escaped_content=escaped_content)
 
+
 def nextbus_stop_relative(agency, route, stop, relative):
   if relative not in ["next", "previous"]:
     return "Not understood."
 
-  route_title, stop_info = nextbus_route_helper(agency, route)
+  route_title, stop_info = nextbus_route_helper(route)
 
-  options = defaultdict(list) # [stop_tag, stop_name] -> [direction, ...]
+  options = defaultdict(list)  # [stop_id, stop_name] -> [direction, ...]
 
-  for [direction_tag, direction_title], stops in stop_info:
-    previous_stop_tag = None
+  for [direction_id, direction_title], stops in stop_info:
     previous_stop_id = None
     previous_stop_name = None
-    for stop_tag, stop_name, _, _, stop_id in stops:
-      if relative == "next" and (previous_stop_tag == stop or
-                                 previous_stop_id == stop):
-        options[stop_tag or stop_id, stop_name].append(direction_title)
-      elif relative == "previous" and (stop_tag == stop or
-                                       stop_id == stop):
-        options[previous_stop_tag or previous_stop_id, previous_stop_name].append(direction_title)
+    for stop_id, stop_name, _, _, _ in stops:
+      if relative == "next" and previous_stop_id == stop:
+        options[stop_id, stop_name].append(direction_title)
+      elif relative == "previous" and stop_id == stop:
+        options[previous_stop_id, previous_stop_name].append(direction_title)
 
-      previous_stop_tag = stop_tag
       previous_stop_id = stop_id
       previous_stop_name = stop_name
 
@@ -497,55 +579,55 @@ def nextbus_stop_relative(agency, route, stop, relative):
     return html_redirect("../")
 
   if len(options) == 1:
-    stop_identifier, stop_name = options.keys()[0]
+    (stop_id, stop_name), = options.keys()
 
-    if stop_identifier is None:
+    if stop_id is None:
       return html_redirect("../")
     else:
-      return html_redirect("../../%s" % stop_identifier)
+      return html_redirect("../../%s/" % stop_id)
 
   escaped_content = []
-  for (stop_identifier, stop_name), directions in options.items():
+  for (stop_id, stop_name), directions in options.items():
     for direction in directions:
-      escaped_content.append("<span class=row><a href='../../%s'>%s</a> (%s)</span>" % (stop_identifier, stop_name, direction))
+      escaped_content.append("<span class=row><a href='../../%s/'>%s</a> (%s)</span>" % (stop_id, stop_name, direction))
 
   return render_page(
       title="Multiple options for the %s stop" % relative,
       escaped_content=escaped_content)
 
+
 def nextbus_route(agency, route):
   escaped_content = []
 
-  route_title, stop_info = nextbus_route_helper(agency, route)
+  route_title, stop_info = nextbus_route_helper(route)
 
-  for (direction_tag, direction_title), stops in stop_info:
+  for (direction_id, direction_title), stops in stop_info:
     escaped_content.append("<h2>%s</h2>" % direction_title)
-    for stop_tag, stop_name, _, _, stop_id in stops:
-      use_id = stop_id or stop_tag
+    for stop_id, stop_name, lat, lon, _ in stops:
       escaped_content.append(
-          '<a class=row href="%s/">%s</a>' % (use_id, stop_name))
+          '<a class=row href="%s/">%s</a>' % (stop_id, stop_name))
 
   return render_page(
       title="%s Stops" % route_title,
       escaped_content=escaped_content)
 
-def nextbus_agency(agency):
-  routes = []
-  xmldoc = minidom.parseString(slurp(
-      "http://webservices.nextbus.com/service/publicXMLFeed?"
-      "command=routeList&a=%s" % agency,
-      timeout=2))
 
-  for route_node in xmldoc.getElementsByTagName("route"):
-    routes.append((route_node.getAttribute("title"),
-                   route_node.getAttribute("tag")))
+def nextbus_agency(agency):
+  doc = mbta_get("/routes", {}, cache=True)
+  routes = []
+  for route in doc["data"]:
+    attrs = route["attributes"]
+    if not attrs.get("listed_route", True):
+      continue
+    routes.append((route_display_title(attrs, route["id"]), route["id"]))
   natural_sort_in_place(routes)
 
   return render_page(
-      title="%s routes" % escape(agency.upper()),
+      title="MBTA Routes",
       escaped_content=[
           '<a class=row href="%s/">%s</a>' % (escape(tag), escape(title))
           for (title, tag) in routes])
+
 
 def render_page(title,
                 escaped_content,
@@ -667,79 +749,68 @@ def render_page(title,
         "</body>",
         "</html>"])
 
+
 def nextbus_index():
-  agencies = []
-  xmldoc = minidom.parseString(slurp(
-      "http://webservices.nextbus.com/service/publicXMLFeed?command=agencyList",
-      timeout=2))
+  # There's only one agency (the MBTA) now, so skip straight there.
+  return html_redirect("mbta/")
 
-  for agency_node in xmldoc.getElementsByTagName("agency"):
-    agencies.append((agency_node.getAttribute("shortTitle") or agency_node.getAttribute("title"),
-                     agency_node.getAttribute("tag")))
-  natural_sort_in_place(agencies)
-
-  return render_page(
-      title="agencies",
-      escaped_content=[
-          '<a class=row href="%s/">%s</a>' % (escape(tag), escape(title))
-          for (title, tag) in agencies],
-      include_up=False)
 
 def nextbus(path):
   if path == "/":
     return nextbus_index()
 
-  r = re.match("^/([^/]+)/([^/]+)/([^/]+)/vehicle/([^/]+)/$", path)
+  r = re.match(r"^/([^/]+)/([^/]+)/([^/]+)/vehicle/([^/]+)/$", path)
   if r:
     return nextbus_stop_vehicle(*r.groups())
 
-  r = re.match("^/([^/]+)/([^/]+)/([^/]+)/(next|previous)/$", path)
+  r = re.match(r"^/([^/]+)/([^/]+)/([^/]+)/(next|previous)/$", path)
   if r:
     return nextbus_stop_relative(*r.groups())
 
-  r = re.match("^/([^/]+)/([^/]+)/([^/]+)/$", path)
+  r = re.match(r"^/([^/]+)/([^/]+)/([^/]+)/$", path)
   if r:
     return nextbus_stop(*r.groups())
 
-  r = re.match("^/([^/]+)/([^/]+)/$", path)
+  r = re.match(r"^/([^/]+)/([^/]+)/$", path)
   if r:
     return nextbus_route(*r.groups())
 
-  r = re.match("^/([^/]+)/$", path)
+  r = re.match(r"^/([^/]+)/$", path)
   if r:
     return nextbus_agency(*r.groups())
 
-  return "nextbus: '%s 'not understood" % escape(path)
+  return "nextbus: '%s' not understood" % escape(path)
+
+
+def die500(e):
+    trb = "%s: %s\n\n%s" % (e.__class__.__name__, e, traceback.format_exc())
+    return trb
 
 
 # actually respond to the request
 # raising errors here will give a 500 and put the traceback in the body
-def start(environ, start_response):
-    path = environ["PATH_INFO"]
-    if path.startswith("/wsgi/"):
-      path = path[len("/wsgi"):]
-
-    if path.startswith("/nextbus"):
-        return nextbus.nextbus(path.replace("/nextbus", ""))
-
-    return "not supported"
-
-def die500(start_response, e):
-    trb = "%s: %s\n\n%s" % (e.__class__.__name__, e, traceback.format_exc())
-    start_response('500 Internal Server Error',
-                   [('content-type', 'text/plain')])
-    return trb
-
 def application(environ, start_response):
     path = environ["PATH_INFO"]
     if path.startswith("/nextbus"):
       try:
-        output = nextbus(path.replace("/nextbus", ""))
+        output = nextbus(path[len("/nextbus"):])
         start_response('200 OK', [('content-type', 'text/html')])
-      except Exception, e:
-        output = die500(start_response, e)
+      except Exception as e:
+        output = die500(e)
+        start_response('500 Internal Server Error', [('content-type', 'text/plain')])
     else:
       output = "not understood"
+      start_response('404 Not Found', [('content-type', 'text/plain')])
 
     return (output.encode('utf8'), )
 
+
+if __name__ == "__main__":
+  from wsgiref.simple_server import make_server
+  port = int(os.environ.get("PORT", 8000))
+  print("Serving on http://127.0.0.1:%d/nextbus/" % port)
+  if not MBTA_API_KEY:
+    print("Warning: MBTA_API_KEY not set; the MBTA API allows only "
+          "20 requests/minute without one. Register at "
+          "https://api-v3.mbta.com/register")
+  make_server("", port, application).serve_forever()
