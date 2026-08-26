@@ -6,12 +6,18 @@ import datetime
 import json
 import os
 import re
+import sys
 import time
 import traceback
 import urllib.parse
 import urllib.request
 import zoneinfo
 from collections import defaultdict
+
+# uwsgi loads this by file path with the working directory set to /, so
+# the directory holding it isn't on sys.path and a plain sibling import
+# fails at startup -- taking down the whole app, not just the feature.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from terminus_tables import TABLES as TERMINUS_TABLES
 
