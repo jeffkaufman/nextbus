@@ -10,7 +10,10 @@ import time
 import traceback
 import urllib.parse
 import urllib.request
+import zoneinfo
 from collections import defaultdict
+
+from terminus_tables import TABLES as TERMINUS_TABLES
 
 MBTA_API_BASE = "https://api-v3.mbta.com"
 MBTA_API_KEY = os.environ.get("MBTA_API_KEY")
@@ -53,7 +56,7 @@ def to_time(seconds):
   return "%ssec" % seconds
 
 
-def mbta_get(endpoint, params, timeout=5, cache=False):
+def mbta_get(endpoint, params, timeout=5, cache=False, ttl=None):
   cache_key = (endpoint, tuple(sorted(params.items())))
   if cache:
     cached = _cache.get(cache_key)
@@ -74,7 +77,7 @@ def mbta_get(endpoint, params, timeout=5, cache=False):
     value = json.loads(response.read().decode("utf8"))
 
   if cache:
-    _cache[cache_key] = (time.time() + CACHE_TTL_SECONDS, value)
+    _cache[cache_key] = (time.time() + (ttl or CACHE_TTL_SECONDS), value)
   return value
 
 
@@ -87,6 +90,172 @@ def jsonapi_include_index(document):
 
 def route_display_title(route_attrs, route_id):
   return route_attrs.get("short_name") or route_attrs.get("long_name") or route_id
+
+
+# --- Estimates where the MBTA publishes no predictions ---------------
+#
+# The MBTA doesn't publish predictions for dispatcher-ADDED trips, so
+# at the first stop after some Green Line termini a train can be four
+# minutes out with nothing shown at all.  Since 2026-08-20 scheduled
+# trips are predicted normally, which leaves this biting mainly on
+# weekends and during disruptions, when most trips are ADDED.
+#
+# Where that happens we fall back to what the vehicle feed shows --
+# whether a train has already left the terminus, and how many are
+# sitting at it -- and report a *range* rather than a single time.
+# Someone walking to the stop wants to know whether it's worth
+# hurrying, and a spuriously precise "4 minutes" answers a question we
+# can't actually answer.  The tables are fitted and calibrated by
+# fit_terminus_tables.py; see TERMINUS_ANALYSIS.md.
+
+EASTERN = zoneinfo.ZoneInfo("America/New_York")
+
+# Vehicle positions go stale -- the median is fresh but the tail is
+# long -- so a train whose position last updated half an hour ago
+# shouldn't count towards the terminus queue.
+MAX_POSITION_AGE_SECONDS = 5 * 60
+QUEUE_CAP = 3
+
+# Stop ordering effectively never changes, so cache it for much longer
+# than the default: the MBTA allows only 20 requests/minute without an
+# API key and this is an extra call on top of the predictions fetch.
+STOP_ORDER_TTL_SECONDS = 60 * 60
+
+
+def service_period(now):
+  # Must stay identical to period() in fit_terminus_tables.py.
+  local = now.astimezone(EASTERN)
+  if local.hour < 5:
+    return "late"
+  if local.weekday() >= 5:
+    return "weekend-%d" % (local.hour // 4)
+  if local.hour < 10:
+    return "am"
+  if local.hour < 16:
+    return "mid"
+  if local.hour < 19:
+    return "pm"
+  return "eve"
+
+
+def stop_order(route, direction_id):
+  # (parent station ids in travel order, platform stop id -> parent id,
+  # parent stop id -> name).  Vehicles report the platform they're at,
+  # but the ordering is in terms of parent stations.
+  doc = mbta_get("/stops", {
+      "filter[route]": route,
+      "filter[direction_id]": direction_id,
+      "include": "child_stops",
+  }, cache=True, ttl=STOP_ORDER_TTL_SECONDS)
+  order = [stop["id"] for stop in doc["data"]]
+  parents = {}
+  names = {}
+  for stop in doc["data"]:
+    parents[stop["id"]] = stop["id"]
+    names[stop["id"]] = stop["attributes"].get("name") or stop["id"]
+    for child in stop["relationships"].get("child_stops", {}).get("data", []):
+      parents[child["id"]] = stop["id"]
+  return order, parents, names
+
+
+def terminus_vehicle_state(route, direction_id, target_index, order, parents,
+                           now):
+  # What the vehicle feed says about trains that could plausibly turn
+  # up next: whether one has left the terminus and not yet reached us,
+  # whether it's about to arrive, and how many are parked at the
+  # terminus waiting to go.
+  doc = mbta_get("/vehicles", {"filter[route]": route}, timeout=3)
+  index = {stop_id: i for i, stop_id in enumerate(order)}
+  in_transit = incoming = False
+  queued = 0
+  for vehicle in doc["data"]:
+    attrs = vehicle["attributes"]
+    if attrs.get("direction_id") != direction_id:
+      continue
+    stop_data = vehicle["relationships"].get("stop", {}).get("data")
+    if not stop_data:
+      continue
+    parent = parents.get(stop_data["id"])
+    if parent not in index:
+      continue
+    at = index[parent]
+    status = attrs.get("current_status")
+    if at == 0 and status == "STOPPED_AT":
+      updated_at = attrs.get("updated_at")
+      if not updated_at:
+        continue
+      age = (now - datetime.datetime.fromisoformat(updated_at)).total_seconds()
+      if age <= MAX_POSITION_AGE_SECONDS:
+        queued += 1
+      continue
+    # INCOMING_AT/IN_TRANSIT_TO mean it hasn't reached that stop yet,
+    # so the last stop it actually passed is the one before.
+    position = at if status == "STOPPED_AT" else at - 1
+    if 0 <= position < target_index:
+      in_transit = True
+      if status == "INCOMING_AT":
+        incoming = True
+  return int(in_transit), int(incoming), min(queued, QUEUE_CAP)
+
+
+def terminus_estimate(route, direction_id, stop, now):
+  # (low, high, why) -- seconds until the next train at the 5th and
+  # 95th percentile, high None meaning "further out than we measured",
+  # and a plain-language reason.  None if we can't say anything.
+  entry = TERMINUS_TABLES.get((route, direction_id, stop))
+  if not entry:
+    return None
+  order, parents, names = stop_order(route, direction_id)
+  if stop not in order:
+    return None
+  target_index = order.index(stop)
+  if target_index == 0:
+    return None
+  in_transit, incoming, queued = terminus_vehicle_state(
+      route, direction_id, target_index, order, parents, now)
+  table = entry["table"]
+  # Most specific bucket first, backing off to coarser ones rather
+  # than reading a tail off a handful of samples.
+  found = None
+  for key in ((in_transit, incoming, queued, service_period(now)),
+              (in_transit, incoming, queued),
+              (in_transit, incoming)):
+    if key in table:
+      found = table[key]
+      break
+  if not found:
+    return None
+
+  terminus = escape(names.get(entry["terminus"], "the terminus"))
+  if incoming:
+    why = "a train is arriving"
+  elif in_transit:
+    why = "a train has left %s" % terminus
+  elif queued == 1:
+    why = "a train is waiting at %s" % terminus
+  elif queued:
+    why = "%d trains are waiting at %s" % (queued, terminus)
+  else:
+    why = "no train has left %s yet" % terminus
+  return found[0], found[1], why
+
+
+def format_terminus_estimate(estimate):
+  low, high, why = estimate
+  # Round outwards: understating how soon a train might come is the
+  # error that makes someone miss one.
+  low_minutes = int(low // 60)
+  if high is None:
+    headline = "%d+ minutes, possibly much longer" % low_minutes
+  elif low_minutes == 0:
+    headline = "within %d minutes" % int(-(-high // 60))
+  else:
+    headline = "%d&ndash;%d minutes" % (low_minutes, int(-(-high // 60)))
+  return ("<div class=prediction>No MBTA predictions. "
+          "Next train probably <b>%s</b>.</div>"
+          "<div class=estimate>Estimated because %s &mdash; not an MBTA "
+          "prediction. The wait falls outside this range about "
+          "1 time in 10.</div>" % (headline, why))
 
 
 def nextbus_stop(agency, route, stop):
@@ -192,9 +361,32 @@ def nextbus_stop_helper(route, stop, path_adjust=""):
     # it, so fetch it directly.
     try:
       route_doc = mbta_get("/routes/%s" % route, {}, cache=True)
-      route_titles[route] = route_display_title(route_doc["data"]["attributes"], route)
+      route_attrs = route_doc["data"]["attributes"]
+      route_titles[route] = route_display_title(route_attrs, route)
+      direction_names[route] = route_attrs.get("direction_names") or []
     except Exception:
       route_titles[route] = route
+
+  # A direction the MBTA says nothing about renders no section at all,
+  # which is worst exactly where it's least helpful: one stop past a
+  # Green Line terminus, where a train can be minutes away with
+  # nothing published.  At the few stops where that silence is both
+  # common and predictable, estimate from vehicle positions instead.
+  estimates = {}  # (route_id, direction_id) -> html
+  for direction_id in (0, 1):
+    if (route, direction_id) in buckets:
+      continue
+    if (route, direction_id, stop) not in TERMINUS_TABLES:
+      continue
+    try:
+      estimate = terminus_estimate(route, direction_id, stop, now)
+    except Exception:
+      continue  # a fallback estimate must never break the page
+    if estimate:
+      buckets[route, direction_id] = []
+      estimates[route, direction_id] = format_terminus_estimate(estimate)
+
+  if not any(route_id == route for route_id, _ in buckets):
     buckets[route, None] = []
 
   sections = []  # (sort_title, route_id, html)
@@ -208,6 +400,8 @@ def nextbus_stop_helper(route, stop, path_adjust=""):
     if predictions:
       predictions.sort(key=lambda p: p[0])
       body = "\n".join(html for _, html in predictions)
+    elif (route_id, direction_id) in estimates:
+      body = estimates[route_id, direction_id]
     else:
       body = "<div class=prediction>No predictions.</div>"
     sections.append((title, route_id, header + "\n" + body))
@@ -728,6 +922,12 @@ def render_page(title,
         ".prediction {",
         "  width: 100%;",
         "  margin-bottom: 3px;",
+        "}",
+        ".estimate {",
+        "  width: 100%;",
+        "  margin-bottom: 3px;",
+        "  font-size: 13px;",
+        "  color: #555;",
         "}",
         "#svg {",
         "  width: 90vmin;",
