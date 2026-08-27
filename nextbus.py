@@ -246,6 +246,41 @@ def terminus_estimate(route, direction_id, stop, now):
   return found[0], found[1], why
 
 
+def waiting_at_terminus(route, direction_id, stop, vehicle, cache):
+  # The name of the terminus a predicted train is still sitting at, or
+  # None if it has left (or if this stop isn't just past a terminus).
+  #
+  # Since 2026-08-20 the MBTA predicts trains that haven't departed
+  # yet, which is a big improvement on the old silence, but a train
+  # being held at the terminus keeps a pinned "1 minute" for as long
+  # as it sits there -- observed once for 33 minutes straight at Ball
+  # Square.  "1 minute" means something quite different depending on
+  # whether the train has actually started moving, so say which.
+  key = (route, direction_id, stop)
+  if key not in cache:
+    cache[key] = None
+    entry = TERMINUS_TABLES.get(key)
+    if entry:
+      try:
+        _, parents, names = stop_order(route, direction_id)
+      except Exception:
+        parents = None  # never break the page over a nicety
+      if parents:
+        cache[key] = (entry["terminus"], parents,
+                      names.get(entry["terminus"], "the terminus"))
+  found = cache[key]
+  if not found:
+    return None
+  terminus, parents, name = found
+
+  if vehicle["attributes"].get("current_status") != "STOPPED_AT":
+    return None
+  stop_data = vehicle["relationships"].get("stop", {}).get("data")
+  if not stop_data or parents.get(stop_data["id"]) != terminus:
+    return None
+  return name
+
+
 def format_terminus_estimate(estimate):
   low, high, why = estimate
   # Round outwards: understating how soon a train might come is the
@@ -303,6 +338,10 @@ def nextbus_stop_helper(route, stop, path_adjust=""):
   # below.
   buckets = defaultdict(list)
 
+  # Per-request memo for waiting_at_terminus, whose first lookup for a
+  # given direction costs an API call.
+  terminus_cache = {}
+
   for prediction in doc["data"]:
     attrs = prediction["attributes"]
     rel = prediction["relationships"]
@@ -333,6 +372,11 @@ def nextbus_stop_helper(route, stop, path_adjust=""):
     if vehicle_data:
       vehicle = idx.get(("vehicle", vehicle_data["id"]))
       if vehicle:
+        held_at = waiting_at_terminus(
+            route_id, direction_id, stop, vehicle, terminus_cache)
+        if held_at:
+          extras.append("still at %s" % escape(held_at))
+
         vid = vehicle["id"]
         label = vehicle["attributes"].get("label") or vid
         age_str = ""
