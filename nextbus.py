@@ -309,11 +309,20 @@ def nextbus_stop(agency, route, stop):
       include_arrows=True)
 
 
+def format_prediction(headsign, time_display, extras, split_branches):
+  if split_branches and headsign:
+    extras = [escape(headsign)] + extras
+  if extras:
+    return "<div class=prediction>%s (%s)</div>" % (
+        time_display, ", ".join(extras))
+  return "<div class=prediction>%s</div>" % time_display
+
+
 def nextbus_stop_helper(route, stop, path_adjust=""):
   try:
     doc = mbta_get("/predictions", {
         "filter[stop]": stop,
-        "include": "vehicle,route,stop",
+        "include": "vehicle,route,stop,trip",
     })
   except Exception:
     return (ERROR_TITLE,
@@ -332,10 +341,13 @@ def nextbus_stop_helper(route, stop, path_adjust=""):
 
   now = datetime.datetime.now(datetime.timezone.utc)
 
-  # (route_id, direction_id) -> [(seconds, prediction_html), ...]
+  # (route_id, direction_id) -> [(seconds, headsign, time_display,
+  #                               extras), ...]
   # The API doesn't reliably sort predictions that only have a
   # departure_time (e.g. the start of a trip), so we sort ourselves
-  # below.
+  # below.  The html isn't built until we know whether the direction
+  # has more than one headsign: on a branching line "South" isn't
+  # enough, you need to know Ashmont from Braintree.
   buckets = defaultdict(list)
 
   # Per-request memo for waiting_at_terminus, whose first lookup for a
@@ -364,6 +376,13 @@ def nextbus_stop_helper(route, stop, path_adjust=""):
       minutes = round(seconds / 60.0)
       time_display = "%d minute%s" % (minutes, "" if minutes == 1 else "s")
 
+    headsign = None
+    trip_data = rel.get("trip", {}).get("data")
+    if trip_data:
+      trip = idx.get(("trip", trip_data["id"]))
+      if trip:
+        headsign = trip["attributes"].get("headsign")
+
     extras = []
     if attrs.get("status"):
       extras.append(escape(attrs["status"]))
@@ -389,13 +408,8 @@ def nextbus_stop_helper(route, stop, path_adjust=""):
         extras.append("vehicle <a href='%s../../%s/%s/vehicle/%s'>%s</a>%s" % (
             path_adjust, route_id, stop, vid, escape(label), age_str))
 
-    if extras:
-      prediction_html = "<div class=prediction>%s (%s)</div>" % (
-          time_display, ", ".join(extras))
-    else:
-      prediction_html = "<div class=prediction>%s</div>" % time_display
-
-    buckets[route_id, direction_id].append((seconds, prediction_html))
+    buckets[route_id, direction_id].append(
+        (seconds, headsign, time_display, extras))
 
   route_titles = {}  # route_id -> title
   direction_names = {}  # route_id -> [name0, name1]
@@ -441,6 +455,10 @@ def nextbus_stop_helper(route, stop, path_adjust=""):
 
   sections = []  # (sort_title, route_id, html)
   for (route_id, direction_id), predictions in buckets.items():
+    # Only worth naming the destination when this direction actually
+    # splits; otherwise it's the same word on every line.
+    split_branches = len(set(
+        headsign for _, headsign, _, _ in predictions if headsign)) > 1
     title = route_titles.get(route_id, route_id)
     names = direction_names.get(route_id, [])
     if direction_id is not None and direction_id < len(names) and names[direction_id]:
@@ -449,7 +467,9 @@ def nextbus_stop_helper(route, stop, path_adjust=""):
       header = "<h2>%s</h2>" % escape(title)
     if predictions:
       predictions.sort(key=lambda p: p[0])
-      body = "\n".join(html for _, html in predictions)
+      body = "\n".join(
+          format_prediction(headsign, time_display, extras, split_branches)
+          for _, headsign, time_display, extras in predictions)
     elif (route_id, direction_id) in estimates:
       body = estimates[route_id, direction_id]
     else:
